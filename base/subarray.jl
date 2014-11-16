@@ -2,10 +2,15 @@ typealias NonSliceIndex Union(Colon, Range{Int}, UnitRange{Int}, Array{Int,1})
 typealias ViewIndex Union(Int, NonSliceIndex)
 typealias RangeIndex Union(Int, Range{Int}, UnitRange{Int}, Colon)
 
-type SubArray{T,N,P<:AbstractArray,I<:(ViewIndex...)} <: AbstractArray{T,N}
+# LD is the last dimension up through which this object has efficient
+# linear indexing. If LD==N, then the object itself has efficient
+# linear indexing.
+type SubArray{T,N,P<:AbstractArray,I<:(ViewIndex...),LD} <: AbstractArray{T,N}
     parent::P
     indexes::I
     dims::NTuple{N,Int}
+    first_index::Int   # for linear indexing and pointer
+    stride1::Int       # used only for linear indexing
 end
 
 # Simple utilities
@@ -38,7 +43,9 @@ stagedfunction slice{T,NP}(A::AbstractArray{T,NP}, I::ViewIndex...)
         end
     end
     dims = :(tuple($(sizeexprs...)))
-    :(Base.SubArray{$T,$N,$A,$I}(A, I, $dims))
+    LD = subarray_linearindexing_dim(A, I)
+    strideexpr = stride1expr(A, I, :A, :I, LD)
+    :(SubArray{$T,$N,$A,$I,$LD}(A, I, $dims, first_index(A, I), $strideexpr))
 end
 
 # Conventional style (drop trailing singleton dimensions, keep any other singletons)
@@ -65,7 +72,9 @@ stagedfunction sub{T,NP}(A::AbstractArray{T,NP}, I::ViewIndex...)
     dims = :(tuple($(sizeexprs...)))
     Iext = :(tuple($(Iexprs...)))
     It = tuple(Itypes...)
-    :(Base.SubArray{$T,$N,$A,$It}(A, $Iext, $dims))
+    LD = subarray_linearindexing_dim(A, I)
+    strideexpr = stride1expr(A, I, :A, :I, LD)
+    :(SubArray{$T,$N,$A,$It,$LD}(A, $Iext, $dims, first_index(A, I), $strideexpr))
 end
 
 # Constructing from another SubArray
@@ -110,7 +119,12 @@ stagedfunction slice{T,NV,PV,IV}(V::SubArray{T,NV,PV,IV}, I::ViewIndex...)
     Inew = :(tuple($(indexexprs...)))
     dims = :(tuple($(sizeexprs...)))
     It = tuple(Itypes...)
-    :(Base.SubArray{$T,$N,$PV,$It}(V.parent, $Inew, $dims))
+    LD = subarray_linearindexing_dim(V, I)
+    strideexpr = stride1expr(PV, I, :(V.parent), :Inew, LD)
+    quote
+        Inew = $Inew
+        SubArray{$T,$N,$PV,$It,$LD}(V.parent, Inew, $dims, first_index(V.parent, Inew), $strideexpr)
+    end
 end
 
 stagedfunction sub{T,NV,PV,IV}(V::SubArray{T,NV,PV,IV}, I::ViewIndex...)
@@ -157,11 +171,16 @@ stagedfunction sub{T,NV,PV,IV}(V::SubArray{T,NV,PV,IV}, I::ViewIndex...)
     Inew = :(tuple($(indexexprs...)))
     dims = :(tuple($(sizeexprs...)))
     It = tuple(Itypes...)
-    :(Base.SubArray{$T,$N,$PV,$It}(V.parent, $Inew, $dims))
+    LD = subarray_linearindexing_dim(V, I)
+    strideexpr = stride1expr(PV, I, :(V.parent), :Inew, LD)
+    quote
+        Inew = $Inew
+        SubArray{$T,$N,$PV,$It,$LD}(V.parent, Inew, $dims, first_index(V.parent, Inew), $strideexpr)
+    end
 end
 
 function rangetype(T1, T2)
-    rt = Base.return_types(getindex, (T1, T2))
+    rt = return_types(getindex, (T1, T2))
     length(rt) == 1 || error("Can't infer return type")
     rt[1]
 end
@@ -207,19 +226,70 @@ end
 
 stride(V::SubArray, d::Integer) = d <= ndims(V) ? strides(V)[d] : strides(V)[end] * size(V)[end]
 
+function stride1expr(Atype::Type, Itypes::Tuple, Aexpr, Inewsym, LD)
+    if LD == 0
+        return 0
+    end
+    ex = 1
+    for d = 1:min(LD, length(Itypes))
+        I = Itypes[d]
+        if I <: Real
+            ex = :($ex * size($Aexpr, $d))
+        else
+            ex = :($ex * step($Inewsym[$d]))
+            break
+        end
+    end
+    ex
+end
+
 step(::Colon) = 1
 first(::Colon) = 1
 
-## Pointer conversion (for ccall)
-function first_index(V::SubArray)
+first_index(V::SubArray) = first_index(V.parent, V.indexes)
+function first_index(P::AbstractArray, indexes::Tuple)
     f = 1
     s = 1
-    for i = 1:length(V.indexes)
-        f += (first(V.indexes[i])-1)*s
-        s *= size(V.parent, i)
+    for i = 1:length(indexes)
+        f += (first(indexes[i])-1)*s
+        s *= size(P, i)
     end
     f
 end
+
+# Detecting whether a multidimensional type has fast linear indexing
+ldmax{A<:AbstractArray}(::Type{A}) = typemax(Int)
+ldmax{T,N,P,I,LD}(::Type{SubArray{T,N,P,I,LD}}) = LD
+function subarray_linearindexing_dim{A<:AbstractArray}(::Type{A}, It::Tuple)
+    if isa(linearindexing(A), LinearSlow)
+        return 0
+    end
+    LD = 0
+    while LD < min(length(It), ldmax(A))
+        LD += 1
+        I = It[LD]
+        if I <: Union(Colon, Integer)
+        elseif I <: Range
+            break
+        else
+            LD -= 1
+            break
+        end
+    end
+    LD
+end
+
+#     seenrange = false
+#     for I in It
+#         if seenrange && !(I <: Integer)
+#             return LinearSlow()
+#         end
+#         if I <: Range
+#             seenrange = true
+#         end
+#     end
+#     linearindexing(P)
+# end
 
 convert{T,N,P<:Array,I<:(RangeIndex...)}(::Type{Ptr{T}}, V::SubArray{T,N,P,I}) =
     pointer(V.parent) + (first_index(V)-1)*sizeof(T)
