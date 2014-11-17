@@ -33,7 +33,7 @@ end
 @inline mt_pop!(r::MersenneTwister) = @inbounds return r.vals[r.idx+=1]
 
 function gen_rand(r::MersenneTwister)
-    dsfmt_fill_array_close1_open2!(r.state, r.vals, length(r.vals))
+    dsfmt_fill_array_close1_open2!(r.state, pointer(r.vals), length(r.vals))
     mt_setfull!(r)
 end
 
@@ -218,15 +218,28 @@ end
 
 rand!(r::MersenneTwister, A::AbstractArray{Float64}) = rand_AbstractArray_Float64!(r, A)
 
-fill_array!(s::DSFMT_state, A::Array{Float64}, n::Int, ::Type{CloseOpen}) = dsfmt_fill_array_close_open!(s, A, n)
-fill_array!(s::DSFMT_state, A::Array{Float64}, n::Int, ::Type{Close1Open2}) = dsfmt_fill_array_close1_open2!(s, A, n)
+fill_array!(s::DSFMT_state, A::Ptr{Float64}, n::Int, ::Type{CloseOpen}) = dsfmt_fill_array_close_open!(s, A, n)
+fill_array!(s::DSFMT_state, A::Ptr{Float64}, n::Int, ::Type{Close1Open2}) = dsfmt_fill_array_close1_open2!(s, A, n)
 
 function rand!{I<:FloatInterval}(r::MersenneTwister, A::Array{Float64}, n=length(A), ::Type{I}=CloseOpen)
     if n < dsfmt_get_min_array_size()
         rand_AbstractArray_Float64!(r, A, n, I)
     else
-        fill_array!(r.state, A, 2*(n ÷ 2), I)
-        isodd(n) && (A[n] = rand(r, I))
+        pA = pointer(A)
+        rem = Int(pA) % 16
+        if rem > 0
+            pA2 = pA + 16 - rem
+            n2 = rem < 8 ? n-2 : n-1
+            rand!(r, pointer_to_array(pA2, n2), n2, I)
+            unsafe_copy!(pA, pA2, n2)
+            for i=n2+1:n
+                A[i] = rand(r, I)
+            end
+        else
+            # pA is 16-byte aligned, so it's safe to use fill_array!
+            fill_array!(r.state, pA, 2*(n ÷ 2), I)
+            isodd(n) && (A[n] = rand(r, I))
+        end
     end
     A
 end
